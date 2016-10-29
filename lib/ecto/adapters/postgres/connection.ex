@@ -128,7 +128,7 @@ if Code.ensure_loaded?(Postgrex) do
       offset   = offset(query, sources)
       lock     = lock(query.lock)
 
-      assemble([select, from, join, where, group_by, having, order_by, limit, offset, lock])
+      IO.iodata_to_binary([select, from, join, where, group_by, having, order_by, limit, offset, lock])
     end
 
     def update_all(%{from: from} = query, prefix \\ nil) do
@@ -139,8 +139,8 @@ if Code.ensure_loaded?(Postgrex) do
       {join, wheres} = using_join(query, :update_all, "FROM", sources)
       where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      assemble([prefix || "UPDATE #{from} AS #{name} SET", fields, join,
-                where, returning(query, sources)])
+      IO.iodata_to_binary([prefix || ["UPDATE ", from, " AS ", name, " SET "],
+                           fields, join, where, returning(query, sources)])
     end
 
     def delete_all(%{from: from} = query) do
@@ -150,25 +150,24 @@ if Code.ensure_loaded?(Postgrex) do
       {join, wheres} = using_join(query, :delete_all, "USING", sources)
       where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      assemble(["DELETE FROM #{from} AS #{name}", join, where, returning(query, sources)])
+      IO.iodata_to_binary(["DELETE FROM ", from, " AS ", name, join, where, returning(query, sources)])
     end
 
     def insert(prefix, table, header, rows, on_conflict, returning) do
       values =
         if header == [] do
-          "VALUES " <> Enum.map_join(rows, ",", fn _ -> "(DEFAULT)" end)
+          [" VALUES ", intersperse(rows, ?,, fn _ -> "(DEFAULT)" end)]
         else
-          "(" <> Enum.map_join(header, ",", &quote_name/1) <> ") " <>
-          "VALUES " <> insert_all(rows, 1, "")
+          [?\s, ?(, intersperse(header, ?,, &quote_name/1), ") VALUES ", insert_all(rows, 1)]
         end
 
-      assemble(["INSERT INTO #{quote_table(prefix, table)}", insert_as(on_conflict),
-                values, on_conflict(on_conflict), returning(returning)])
+      IO.iodata_to_binary(["INSERT INTO ", quote_table(prefix, table),
+                           insert_as(on_conflict), values, on_conflict(on_conflict), returning(returning)])
     end
 
     defp insert_as({%{from: from} = query, _, _}) do
       {_, name} = get_source(%{query | joins: []}, create_names(query), 0, from)
-      "AS #{name}"
+      [" AS ", name]
     end
     defp insert_as({_, _, _}) do
       []
@@ -178,60 +177,62 @@ if Code.ensure_loaded?(Postgrex) do
       []
     end
     defp on_conflict({:nothing, _, targets}) do
-      "ON CONFLICT " <> conflict_target(targets) <> "DO NOTHING"
+      [" ON CONFLICT ", conflict_target(targets), "DO NOTHING"]
     end
     defp on_conflict({query, _, targets}) do
-      "ON CONFLICT " <> conflict_target(targets) <> "DO " <> update_all(query, "UPDATE SET")
+      [" ON CONFLICT ", conflict_target(targets), "DO ", update_all(query, "UPDATE SET ")]
     end
+
     defp conflict_target([]) do
       ""
     end
     defp conflict_target(targets) do
-      "(" <> Enum.map_join(targets, ",", &quote_name/1) <> ") "
+      [?(, intersperse(targets, ?,, &quote_name/1), ?), ?\s]
     end
 
-    defp insert_all([row|rows], counter, acc) do
-      {counter, row} = insert_each(row, counter, "")
-      insert_all(rows, counter, acc <> ",(" <> row <> ")")
-    end
-    defp insert_all([], _counter, "," <> acc) do
-      acc
+    defp insert_all(rows, counter) do
+      intersperse_reduce(rows, ?,, counter, fn row, counter ->
+        {row, counter} = insert_each(row, counter)
+        {[?(, row, ?)], counter}
+      end)
+      |> elem(0)
     end
 
-    defp insert_each([nil|t], counter, acc),
-      do: insert_each(t, counter, acc <> ",DEFAULT")
-    defp insert_each([_|t], counter, acc),
-      do: insert_each(t, counter + 1, acc <> ",$" <> Integer.to_string(counter))
-    defp insert_each([], counter, "," <> acc),
-      do: {counter, acc}
+    defp insert_each(values, counter) do
+      intersperse_reduce(values, ?,, counter, fn
+        nil, counter ->
+          {"DEFAULT", counter}
+        _, counter ->
+          {[?$, Integer.to_string(counter)], counter + 1}
+      end)
+    end
 
     def update(prefix, table, fields, filters, returning) do
-      {fields, count} = Enum.map_reduce fields, 1, fn field, acc ->
-        {"#{quote_name(field)} = $#{acc}", acc + 1}
-      end
+      {fields, count} = intersperse_reduce(fields, ", ", 1, fn field, acc ->
+        {[quote_name(field), " = $", Integer.to_string(acc)], acc + 1}
+      end)
 
-      {filters, _count} = Enum.map_reduce filters, count, fn field, acc ->
-        {"#{quote_name(field)} = $#{acc}", acc + 1}
-      end
+      {filters, _count} = intersperse_reduce(filters, " AND ", count, fn field, acc ->
+        {[quote_name(field), " = $", Integer.to_string(acc)], acc + 1}
+      end)
 
-      assemble(["UPDATE #{quote_table(prefix, table)} SET " <> Enum.join(fields, ", "),
-                "WHERE " <> Enum.join(filters, " AND "),
-                returning(returning)])
+      IO.iodata_to_binary(["UPDATE ", quote_table(prefix, table), " SET ",
+                           fields, " WHERE ", filters, returning(returning)])
     end
 
     def delete(prefix, table, filters, returning) do
-      {filters, _} = Enum.map_reduce filters, 1, fn field, acc ->
-        {"#{quote_name(field)} = $#{acc}", acc + 1}
-      end
+      {filters, _} = intersperse_reduce(filters, " AND ", 1, fn field, acc ->
+        {[quote_name(field), " = $", Integer.to_string(acc)], acc + 1}
+      end)
 
-      assemble(["DELETE FROM #{quote_table(prefix, table)} WHERE " <> Enum.join(filters, " AND "),
-                returning(returning)])
+      IO.iodata_to_binary(["DELETE FROM ", quote_table(prefix, table), " WHERE ",
+                           filters, returning(returning)])
     end
 
     ## Query generation
 
     binary_ops =
-      [==: "=", !=: "!=", <=: "<=", >=: ">=", <:  "<", >:  ">",
+      [==: ?=, !=: "!=", <=: "<=", >=: ">=", <: ?<, >: ?>,
        and: "AND", or: "OR", ilike: "ILIKE", like: "LIKE"]
 
     @binary_ops Keyword.keys(binary_ops)
@@ -243,58 +244,59 @@ if Code.ensure_loaded?(Postgrex) do
     defp handle_call(fun, _arity), do: {:fun, Atom.to_string(fun)}
 
     defp select(%Query{select: %{fields: fields}} = query, select_distinct, sources) do
-      "SELECT " <> select_distinct <> select_fields(fields, sources, query)
+      ["SELECT", select_distinct, ?\s, select_fields(fields, sources, query)]
     end
 
     defp select_fields([], _sources, _query),
       do: "TRUE"
     defp select_fields(fields, sources, query) do
-      Enum.map_join(fields, ", ", fn
+      intersperse(fields, ", ", fn
         {key, value} ->
-          expr(value, sources, query) <> " AS " <> quote_name(key)
+          [expr(value, sources, query), " AS ", quote_name(key)]
         value ->
           expr(value, sources, query)
       end)
     end
 
-    defp distinct(nil, _, _), do: {"", []}
-    defp distinct(%QueryExpr{expr: []}, _, _), do: {"", []}
-    defp distinct(%QueryExpr{expr: true}, _, _), do: {"DISTINCT ", []}
-    defp distinct(%QueryExpr{expr: false}, _, _), do: {"", []}
+    defp distinct(nil, _, _), do: {[], []}
+    defp distinct(%QueryExpr{expr: []}, _, _), do: {[], []}
+    defp distinct(%QueryExpr{expr: true}, _, _), do: {" DISTINCT", []}
+    defp distinct(%QueryExpr{expr: false}, _, _), do: {[], []}
     defp distinct(%QueryExpr{expr: exprs}, sources, query) do
-      distinct = Enum.map_join(exprs, ", ", fn {_, expr} -> expr(expr, sources, query) end)
-      {"DISTINCT ON (" <> distinct <> ") ", exprs}
+      {[" DISTINCT ON (",
+        intersperse(exprs, ", ", fn {_, expr} -> expr(expr, sources, query) end), ?)],
+       exprs}
     end
 
     defp from(%{from: from} = query, sources) do
       {from, name} = get_source(query, sources, 0, from)
-      "FROM #{from} AS #{name}"
+      [" FROM ", from, " AS ", name]
     end
 
     defp update_fields(%Query{updates: updates} = query, sources) do
       for(%{expr: expr} <- updates,
           {op, kw} <- expr,
           {key, value} <- kw,
-          do: update_op(op, key, value, sources, query)) |> Enum.join(", ")
+          do: update_op(op, key, value, sources, query)) |> Enum.intersperse(", ")
     end
 
     defp update_op(:set, key, value, sources, query) do
-      quote_name(key) <> " = " <> expr(value, sources, query)
+      [quote_name(key), " = ", expr(value, sources, query)]
     end
 
     defp update_op(:inc, key, value, sources, query) do
       quoted = quote_name(key)
-      quoted <> " = " <> quoted <> " + " <> expr(value, sources, query)
+      [quoted, " = ", quoted, " + ", expr(value, sources, query)]
     end
 
     defp update_op(:push, key, value, sources, query) do
       quoted = quote_name(key)
-      quoted <> " = array_append(" <> quoted <> ", " <> expr(value, sources, query) <> ")"
+      [quoted, " = array_append(", quoted, ", ", expr(value, sources, query), ?)]
     end
 
     defp update_op(:pull, key, value, sources, query) do
       quoted = quote_name(key)
-      quoted <> " = array_remove(" <> quoted <> ", " <> expr(value, sources, query) <> ")"
+      [quoted, " = array_remove(", quoted, ", ", expr(value, sources, query), ?)]
     end
 
     defp update_op(command, _key, _value, _sources, query) do
@@ -304,10 +306,10 @@ if Code.ensure_loaded?(Postgrex) do
     defp using_join(%Query{joins: []}, _kind, _prefix, _sources), do: {[], []}
     defp using_join(%Query{joins: joins} = query, kind, prefix, sources) do
       froms =
-        Enum.map_join(joins, ", ", fn
+        intersperse(joins, ", ", fn
           %JoinExpr{qual: :inner, ix: ix, source: source} ->
             {join, name} = get_source(query, sources, ix, source)
-            join <> " AS " <> name
+            [join, " AS ", name]
           %JoinExpr{qual: qual} ->
             error!(query, "PostgreSQL supports only inner joins on #{kind}, got: `#{qual}`")
         end)
@@ -317,17 +319,17 @@ if Code.ensure_loaded?(Postgrex) do
             value != true,
             do: expr |> Map.put(:__struct__, BooleanExpr) |> Map.put(:op, :and)
 
-      {prefix <> " " <> froms, wheres}
+      {[?\s, prefix, ?\s, froms], wheres}
     end
 
     defp join(%Query{joins: []}, _sources), do: []
     defp join(%Query{joins: joins} = query, sources) do
-      Enum.map_join(joins, " ", fn
+      [?\s, intersperse(joins, ?\s, fn
         %JoinExpr{on: %QueryExpr{expr: expr}, qual: qual, ix: ix, source: source} ->
           {join, name} = get_source(query, sources, ix, source)
           qual = join_qual(qual)
-          qual <> " " <> join <> " AS " <> name <> " ON " <> expr(expr, sources, query)
-      end)
+          [qual, ?\s, join, " AS ", name, " ON ", expr(expr, sources, query)]
+      end)]
     end
 
     defp join_qual(:inner), do: "INNER JOIN"
@@ -347,14 +349,14 @@ if Code.ensure_loaded?(Postgrex) do
 
     defp group_by(%Query{group_bys: group_bys} = query, sources) do
       exprs =
-        Enum.map_join(group_bys, ", ", fn
+        intersperse(group_bys, ", ", fn
           %QueryExpr{expr: expr} ->
-            Enum.map_join(expr, ", ", &expr(&1, sources, query))
+            intersperse(expr, ", ", &expr(&1, sources, query))
         end)
 
       case exprs do
-        "" -> []
-        _  -> "GROUP BY " <> exprs
+        [] -> []
+        _  -> [" GROUP BY ", exprs]
       end
     end
 
@@ -363,53 +365,53 @@ if Code.ensure_loaded?(Postgrex) do
     end
     defp order_by(%Query{order_bys: order_bys} = query, distinct, sources) do
       order_bys = Enum.flat_map(order_bys, & &1.expr)
-      exprs = Enum.map_join(distinct ++ order_bys, ", ", &order_by_expr(&1, sources, query))
-      "ORDER BY " <> exprs
+      exprs = intersperse(distinct ++ order_bys, ", ", &order_by_expr(&1, sources, query))
+      [" ORDER BY ", exprs]
     end
 
     defp order_by_expr({dir, expr}, sources, query) do
       str = expr(expr, sources, query)
       case dir do
         :asc  -> str
-        :desc -> str <> " DESC"
+        :desc -> [str, " DESC"]
       end
     end
 
     defp limit(%Query{limit: nil}, _sources), do: []
     defp limit(%Query{limit: %QueryExpr{expr: expr}} = query, sources) do
-      "LIMIT " <> expr(expr, sources, query)
+      [" LIMIT ", expr(expr, sources, query)]
     end
 
     defp offset(%Query{offset: nil}, _sources), do: []
     defp offset(%Query{offset: %QueryExpr{expr: expr}} = query, sources) do
-      "OFFSET " <> expr(expr, sources, query)
+      [" OFFSET ", expr(expr, sources, query)]
     end
 
     defp lock(nil), do: []
-    defp lock(lock_clause), do: lock_clause
+    defp lock(lock_clause), do: [?\s, lock_clause]
 
     defp boolean(_name, [], _sources, _query), do: []
     defp boolean(name, [%{expr: expr} | query_exprs], sources, query) do
-      name <> " " <>
-        Enum.reduce(query_exprs, paren_expr(expr, sources, query), fn
-          %BooleanExpr{expr: expr, op: :and}, acc ->
-            acc <> " AND " <> paren_expr(expr, sources, query)
-          %BooleanExpr{expr: expr, op: :or}, acc ->
-            acc <> " OR " <> paren_expr(expr, sources, query)
-        end)
+      [?\s, name, ?\s,
+       Enum.reduce(query_exprs, paren_expr(expr, sources, query), fn
+         %BooleanExpr{expr: expr, op: :and}, acc ->
+           [acc, " AND ", paren_expr(expr, sources, query)]
+         %BooleanExpr{expr: expr, op: :or}, acc ->
+           [acc, " OR ", paren_expr(expr, sources, query)]
+       end)]
     end
 
     defp paren_expr(expr, sources, query) do
-      "(" <> expr(expr, sources, query) <> ")"
+      [?(, expr(expr, sources, query), ?)]
     end
 
     defp expr({:^, [], [ix]}, _sources, _query) do
-      "$#{ix+1}"
+      [?$, Integer.to_string(ix + 1)]
     end
 
     defp expr({{:., _, [{:&, _, [idx]}, field]}, _, []}, sources, _query) when is_atom(field) do
       {_, name, _} = elem(sources, idx)
-      "#{name}.#{quote_name(field)}"
+      [name, ?., quote_name(field)]
     end
 
     defp expr({:&, _, [idx, fields, _counter]}, sources, query) do
@@ -420,7 +422,7 @@ if Code.ensure_loaded?(Postgrex) do
           "Please specify a schema or specify exactly which fields from " <>
           "#{inspect name} you desire")
       end
-      Enum.map_join(fields, ", ", &"#{name}.#{quote_name(&1)}")
+      intersperse(fields, ", ", &[name, ?., quote_name(&1)])
     end
 
     defp expr({:in, _, [_left, []]}, _sources, _query) do
@@ -428,24 +430,24 @@ if Code.ensure_loaded?(Postgrex) do
     end
 
     defp expr({:in, _, [left, right]}, sources, query) when is_list(right) do
-      args = Enum.map_join right, ",", &expr(&1, sources, query)
-      expr(left, sources, query) <> " IN (" <> args <> ")"
+      args = intersperse(right, ?,, &expr(&1, sources, query))
+      [expr(left, sources, query), " IN (", args, ?)]
     end
 
     defp expr({:in, _, [left, {:^, _, [ix, _]}]}, sources, query) do
-      expr(left, sources, query) <> " = ANY($#{ix+1})"
+      [expr(left, sources, query), " = ANY($", Integer.to_string(ix + 1), ?)]
     end
 
     defp expr({:in, _, [left, right]}, sources, query) do
-      expr(left, sources, query) <> " = ANY(" <> expr(right, sources, query) <> ")"
+      [expr(left, sources, query), " = ANY(", expr(right, sources, query), ?)]
     end
 
     defp expr({:is_nil, _, [arg]}, sources, query) do
-      "#{expr(arg, sources, query)} IS NULL"
+      [expr(arg, sources, query), " IS NULL"]
     end
 
     defp expr({:not, _, [expr]}, sources, query) do
-      "NOT (" <> expr(expr, sources, query) <> ")"
+      ["NOT (", expr(expr, sources, query), ?)]
     end
 
     defp expr(%Ecto.SubQuery{query: query, fields: fields}, _sources, _query) do
@@ -457,43 +459,42 @@ if Code.ensure_loaded?(Postgrex) do
     end
 
     defp expr({:fragment, _, parts}, sources, query) do
-      Enum.map_join(parts, "", fn
+      Enum.map(parts, fn
         {:raw, part}  -> part
         {:expr, expr} -> expr(expr, sources, query)
       end)
     end
 
     defp expr({:datetime_add, _, [datetime, count, interval]}, sources, query) do
-      "(" <> expr(datetime, sources, query) <> "::timestamp + "
-          <> interval(count, interval, sources, query) <> ")::timestamp"
+      ["(", expr(datetime, sources, query), "::timestamp + ",
+       interval(count, interval, sources, query), ")::timestamp"]
     end
 
     defp expr({:date_add, _, [date, count, interval]}, sources, query) do
-      "(" <> expr(date, sources, query) <> "::date + "
-          <> interval(count, interval, sources, query) <> ")::date"
+      ["(", expr(date, sources, query), "::date + ",
+       interval(count, interval, sources, query), ")::date"]
     end
 
     defp expr({fun, _, args}, sources, query) when is_atom(fun) and is_list(args) do
       {modifier, args} =
         case args do
           [rest, :distinct] -> {"DISTINCT ", [rest]}
-          _ -> {"", args}
+          _ -> {[], args}
         end
 
       case handle_call(fun, length(args)) do
         {:binary_op, op} ->
           [left, right] = args
-          op_to_binary(left, sources, query) <>
-          " #{op} "
-          <> op_to_binary(right, sources, query)
-
+          [op_to_binary(left, sources, query),
+           ?\s, op, ?\s,
+           op_to_binary(right, sources, query)]
         {:fun, fun} ->
-          "#{fun}(" <> modifier <> Enum.map_join(args, ", ", &expr(&1, sources, query)) <> ")"
+          [fun, ?(, modifier, intersperse(args, ", ", &expr(&1, sources, query)), ?)]
       end
     end
 
     defp expr(list, sources, query) when is_list(list) do
-      "ARRAY[" <> Enum.map_join(list, ",", &expr(&1, sources, query)) <> "]"
+      ["ARRAY[", intersperse(list, ?,, &expr(&1, sources, query)), ?]]
     end
 
     defp expr(%Decimal{} = decimal, _sources, _query) do
@@ -502,12 +503,11 @@ if Code.ensure_loaded?(Postgrex) do
 
     defp expr(%Ecto.Query.Tagged{value: binary, type: :binary}, _sources, _query)
         when is_binary(binary) do
-      hex = Base.encode16(binary, case: :lower)
-      "'\\x#{hex}'::bytea"
+      ["'\\x", Base.encode16(binary, case: :lower), "'::bytea"]
     end
 
     defp expr(%Ecto.Query.Tagged{value: other, type: type}, sources, query) do
-      expr(other, sources, query) <> "::" <> ecto_to_db(type)
+      [expr(other, sources, query), ?:, ?:, ecto_to_db(type)]
     end
 
     defp expr(nil, _sources, _query),   do: "NULL"
@@ -515,7 +515,7 @@ if Code.ensure_loaded?(Postgrex) do
     defp expr(false, _sources, _query), do: "FALSE"
 
     defp expr(literal, _sources, _query) when is_binary(literal) do
-      "'#{escape_string(literal)}'"
+      [?\', escape_string(literal), ?\']
     end
 
     defp expr(literal, _sources, _query) when is_integer(literal) do
@@ -523,21 +523,21 @@ if Code.ensure_loaded?(Postgrex) do
     end
 
     defp expr(literal, _sources, _query) when is_float(literal) do
-      String.Chars.Float.to_string(literal) <> "::float"
+      [String.Chars.Float.to_string(literal), "::float"]
     end
 
     defp interval(count, interval, _sources, _query) when is_integer(count) do
-      "interval '" <> String.Chars.Integer.to_string(count) <> " " <> interval <> "'"
+      ["interval '", String.Chars.Integer.to_string(count), ?\s, interval, ?\']
     end
 
     defp interval(count, interval, _sources, _query) when is_float(count) do
       count = :erlang.float_to_binary(count, [:compact, decimals: 16])
-      "interval '" <> count <> " " <> interval <> "'"
+      ["interval '", count, ?\s, interval, ?\']
     end
 
     defp interval(count, interval, sources, query) do
-      "(" <> expr(count, sources, query) <> "::numeric * "
-          <> interval(1, interval, sources, query) <> ")"
+      [?(, expr(count, sources, query), "::numeric * ",
+       interval(1, interval, sources, query), ?)]
     end
 
     defp op_to_binary({op, _, [_, _]} = expr, sources, query) when op in @binary_ops do
@@ -551,12 +551,12 @@ if Code.ensure_loaded?(Postgrex) do
     defp returning(%Query{select: nil}, _sources),
       do: []
     defp returning(%Query{select: %{fields: fields}} = query, sources),
-      do: "RETURNING " <> select_fields(fields, sources, query)
+      do: [" RETURNING ", select_fields(fields, sources, query)]
 
     defp returning([]),
       do: []
     defp returning(returning),
-      do: "RETURNING " <> Enum.map_join(returning, ", ", &quote_name/1)
+      do: [" RETURNING ", intersperse(returning, ", ", &quote_name/1)]
 
     defp create_names(%{prefix: prefix, sources: sources}) do
       create_names(prefix, sources, 0, tuple_size(sources)) |> List.to_tuple()
@@ -569,11 +569,11 @@ if Code.ensure_loaded?(Postgrex) do
             name = String.first(table) <> Integer.to_string(pos)
             {quote_table(prefix, table), name, schema}
           {:fragment, _, _} ->
-            {nil, "f" <> Integer.to_string(pos), nil}
+            {nil, [?f, Integer.to_string(pos)], nil}
           %Ecto.SubQuery{} ->
-            {nil, "s" <> Integer.to_string(pos), nil}
+            {nil, [?s, Integer.to_string(pos)], nil}
         end
-      [current|create_names(prefix, sources, pos + 1, limit)]
+      [current | create_names(prefix, sources, pos + 1, limit)]
     end
 
     defp create_names(_prefix, _sources, pos, pos) do
@@ -908,6 +908,26 @@ if Code.ensure_loaded?(Postgrex) do
       list
       |> List.flatten
       |> Enum.join(" ")
+    end
+
+    defp intersperse(list, separator, mapper, acc \\ [])
+    defp intersperse([], _separator, _mapper, acc),
+      do: acc
+    defp intersperse([elem], _separator, mapper, acc),
+      do: [acc | mapper.(elem)]
+    defp intersperse([elem | rest], separator, mapper, acc),
+      do: intersperse(rest, separator, mapper, [acc, mapper.(elem), separator])
+
+    defp intersperse_reduce(list, separator, user_acc, reducer, acc \\ [])
+    defp intersperse_reduce([], _separator, user_acc, _reducer, acc),
+      do: {acc, user_acc}
+    defp intersperse_reduce([elem], _separator, user_acc, reducer, acc) do
+      {elem, user_acc} = reducer.(elem, user_acc)
+      {[acc | elem], user_acc}
+    end
+    defp intersperse_reduce([elem | rest], separator, user_acc, reducer, acc) do
+      {elem, user_acc} = reducer.(elem, user_acc)
+      intersperse_reduce(rest, separator, user_acc, reducer, [acc, elem, separator])
     end
 
     defp if_do(condition, value) do
