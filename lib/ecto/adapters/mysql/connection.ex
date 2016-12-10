@@ -132,6 +132,7 @@ if Code.ensure_loaded?(Mariaex) do
       "INSERT INTO #{quote_table(prefix, table)} (" <> fields <> ") VALUES "
         <> insert_all(rows) <> on_conflict(on_conflict, header)
     end
+
     def insert(_prefix, _table, _header, _rows, _on_conflict, _returning) do
       error!(nil, "RETURNING is not supported in insert/insert_all by MySQL")
     end
@@ -145,6 +146,16 @@ if Code.ensure_loaded?(Mariaex) do
     defp on_conflict({:nothing, _, []}, [field | _]) do
       quoted = quote_name(field)
       " ON DUPLICATE KEY UPDATE " <> quoted <> " = " <> quoted
+    end
+    defp on_conflict({:replace_all, _, []}, _header) do
+      updates = Enum.map(_header, fn field ->
+        quoted = quote_name(field)
+
+        quoted <> " = " <> quoted
+      end)
+      |> Enum.join(",")
+
+      " ON DUPLICATE KEY UPDATE " <> updates
     end
     defp on_conflict({query, _, []}, _header) do
       " ON DUPLICATE KEY " <> update_all(query, "UPDATE")
