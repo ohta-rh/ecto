@@ -416,6 +416,8 @@ defmodule Ecto.Repo.Schema do
         raise ArgumentError, ":conflict_target option is forbidden when :on_conflict is :raise"
       :nothing ->
         {:nothing, [], conflict_target}
+      :replace_all ->
+        {:replace_all, [], conflict_target}
       [_ | _] = on_conflict ->
         from = if schema, do: {source, schema}, else: source
         query = Ecto.Query.from from, update: ^on_conflict
@@ -423,6 +425,7 @@ defmodule Ecto.Repo.Schema do
       %Ecto.Query{} = query ->
         on_conflict_query(query, {source, schema}, prefix, changes, adapter, conflict_target)
       other ->
+        IO.inspect other
         raise ArgumentError, "unknown value for :on_conflict, got: #{inspect other}"
     end
   end
